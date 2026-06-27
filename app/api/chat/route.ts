@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import type { ChatMessage, ListingData, DefectReport } from "@/lib/types";
 
-const client = new Anthropic();
+const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
 export async function POST(req: NextRequest) {
   try {
@@ -12,23 +12,28 @@ export async function POST(req: NextRequest) {
       defectReport?: DefectReport;
     };
 
-    const systemPrompt = buildSystemPrompt(listing, defectReport);
-
-    const stream = await client.messages.stream({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+    const model = genai.getGenerativeModel({
+      model: "gemini-1.5-flash",
+      systemInstruction: buildSystemPrompt(listing, defectReport),
     });
 
-    // Return a streaming text response
+    // Gemini needs alternating user/model turns — merge any consecutive same-role messages
+    const history = messages.slice(0, -1).map((m) => ({
+      role: m.role === "user" ? "user" : "model",
+      parts: [{ text: m.content }],
+    }));
+
+    const lastMessage = messages[messages.length - 1];
+    const chat = model.startChat({ history });
+    const result = await chat.sendMessageStream(lastMessage.content);
+
     const encoder = new TextEncoder();
     const readable = new ReadableStream({
       async start(controller) {
         try {
-          for await (const chunk of stream) {
-            if (chunk.type === "content_block_delta" && chunk.delta.type === "text_delta") {
-              const text = chunk.delta.text;
+          for await (const chunk of result.stream) {
+            const text = chunk.text();
+            if (text) {
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`));
             }
           }
@@ -59,40 +64,33 @@ export async function POST(req: NextRequest) {
 }
 
 function buildSystemPrompt(listing: ListingData, defectReport?: DefectReport): string {
-  const lines: string[] = [
-    "You are a blunt, knowledgeable used-car advisor — think of a trusted mechanic friend who will shoot straight with you. Give real opinions, not hedge-everything disclaimers.",
+  const lines = [
+    "You are a blunt, knowledgeable used-car advisor — like a trusted mechanic friend who shoots straight. Give real opinions, not hedge-everything disclaimers.",
     "",
-    "Current listing context:",
-    `- Vehicle: ${listing.year} ${listing.make} ${listing.model}${listing.trim ? " " + listing.trim : ""}`,
-    listing.price ? `- Listed price: $${listing.price.toLocaleString()}` : "",
-    listing.mileage ? `- Mileage: ${listing.mileage.toLocaleString()} miles` : "",
-    listing.exteriorColor ? `- Exterior: ${listing.exteriorColor}` : "",
-    listing.vin ? `- VIN: ${listing.vin}` : "",
+    `Vehicle: ${listing.year} ${listing.make} ${listing.model}${listing.trim ? " " + listing.trim : ""}`,
+    listing.price ? `Listed price: $${listing.price.toLocaleString()}` : "",
+    listing.mileage ? `Mileage: ${listing.mileage.toLocaleString()} miles` : "",
+    listing.exteriorColor ? `Exterior: ${listing.exteriorColor}` : "",
+    listing.vin ? `VIN: ${listing.vin}` : "",
     "",
   ];
 
   if (defectReport) {
-    lines.push("Visual inspection findings (from AI photo analysis):");
-    lines.push(`- Overall condition: ${defectReport.overallCondition.toUpperCase()}`);
-    if (defectReport.findings.length > 0) {
-      for (const f of defectReport.findings) {
-        lines.push(`- [${f.severity.toUpperCase()}] ${f.location}: ${f.description}`);
-      }
-    } else {
-      lines.push("- No significant defects visible in photos");
+    lines.push(`Overall condition: ${defectReport.overallCondition.toUpperCase()}`);
+    lines.push("Visual findings:");
+    for (const f of defectReport.findings) {
+      lines.push(`  [${f.severity.toUpperCase()}] ${f.location}: ${f.description}`);
     }
-    lines.push("");
-    lines.push(`Inspector summary: ${defectReport.summary}`);
+    lines.push(`Summary: ${defectReport.summary}`);
     lines.push(`Buy recommendation: ${defectReport.buyRecommendation}`);
     lines.push("");
   }
 
   lines.push(
-    "Answer questions about this specific vehicle. Be direct and concrete — if it looks like a bad deal, say so. If something in the photos concerns you, elaborate. If the user asks what something is worth, give a ballpark based on make/model/year/mileage/condition.",
-    "Keep answers concise but complete. Use plain language. No excessive hedging.",
-    "",
-    "Note: Carfax/AutoCheck history is not available in this MVP — flag that explicitly if the user asks about accident history beyond what photos show. Full history report integration requires a paid partner API (VinAudit, etc.) and will be added in a future version."
+    "Answer questions about this specific vehicle. Be direct — if it looks like a bad deal, say so.",
+    "Keep answers concise but complete. No excessive hedging.",
+    "Carfax/AutoCheck history is not available — flag that if asked. Full history requires a paid partner API."
   );
 
-  return lines.filter((l) => l !== undefined).join("\n");
+  return lines.filter(Boolean).join("\n");
 }
